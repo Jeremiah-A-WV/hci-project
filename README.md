@@ -11,7 +11,8 @@ This repository requires **Python 3.8 to 3.11** due to framework dependencies.
 2. Activate and run:
    ```bash
    source mp_env/bin/activate
-   python your_script.py
+   pip install -r requirements.txt
+   python main.py
    ```
 
 ### For Windows Users:
@@ -22,5 +23,6 @@ This repository requires **Python 3.8 to 3.11** due to framework dependencies.
 2. Activate and run:
    ```cmd
    mp_env\Scripts\activate.bat
-   python your_script.py
+   pip install -r requirements.txt
+   python main.py
    ```
