@@ -1,4 +1,5 @@
 import os
+import time
 
 # 1. Forcefully block macOS from injecting background camera portrait/blur layers
 os.environ["MEDIAPIPE_DISABLE_GPU"] = "1"
@@ -6,17 +7,28 @@ os.environ["CMIO_DISABLE_PORTRAIT_EFFECTS"] = "1"
 
 import cv2
 import mediapipe as mp
+import pyautogui
 
-# 2. Initialize legacy solutions (Bypasses the C++ tasks backend completely)
+# Disable failsafe to prevent the script from crashing if mouse goes to the screen corner
+pyautogui.FAILSAFE = False 
+pyautogui.PAUSE = 0
+
+# 2. Bypasse the C++ tasks backend completely
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
 mp_drawing_styles = mp.solutions.drawing_styles
 
-# Standard 21-point hand skeleton connections map automatically in legacy
+# Standard 21-point hand skeleton connections map automatically
 HAND_CONNECTIONS = mp_hands.HAND_CONNECTIONS
 
-# 3. Target your Mac FaceTime camera using AVFOUNDATION backend
+# 3. Target Mac FaceTime camera using AVFOUNDATION backend
 cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
+
+# Swipe tracking variables
+start_x = None
+cooldown_time = 0
+SWIPE_THRESHOLD = 150    # Pixels the hand must travel horizontally to trigger a swipe
+COOLDOWN_DURATION = 1.0  # Seconds to wait between slide transitions
 
 # Configure the tracking instance
 with mp_hands.Hands(
@@ -49,6 +61,39 @@ with mp_hands.Hands(
         # Draw overlays if hands are tracked
         rgb_frame.flags.writeable = True
         if results.multi_hand_landmarks:
+            hand_landmarks = results.multi_hand_landmarks[0]
+
+            # Track index finger tip (8) instead of the wrist for wider movement
+            index_finger = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+            current_x = int(index_finger.x * w)
+            current_y = int(index_finger.y * h)
+
+            # Draw a blue circle on the tracked finger for visual feedback
+            cv2.circle(frame, (current_x, current_y), 15, (255, 0, 0), cv2.FILLED)
+
+            current_time = time.time()
+
+            # Process movement only if the cooldown has expired
+            if current_time > cooldown_time:
+                if start_x is None:
+                    # Drop an anchor point when the hand is first detected
+                    start_x = current_x
+                else:
+                    # Calculate horizontal distance moved from the anchor
+                    diff_x = current_x - start_x
+
+                    if diff_x > SWIPE_THRESHOLD:
+                        print("Swiped Right! -> Next Slide")
+                        pyautogui.press('right')
+                        cooldown_time = current_time + COOLDOWN_DURATION
+                        start_x = None  # Reset anchor
+                        
+                    elif diff_x < -SWIPE_THRESHOLD:
+                        print("Swiped Left! -> Previous Slide")
+                        pyautogui.press('left')
+                        cooldown_time = current_time + COOLDOWN_DURATION
+                        start_x = None  # Reset anchor
+
             for idx, hand_landmarks in enumerate(results.multi_hand_landmarks):
                 
                 # Fetch handedness (Left vs Right)
@@ -56,7 +101,7 @@ with mp_hands.Hands(
                 if results.multi_handedness and idx < len(results.multi_handedness):
                     hand_label = results.multi_handedness[idx].classification[0].label
 
-                # 4. Use MediaPipe's robust default drawing utility (Prevents shape errors)
+                # 4. Use MediaPipe's drawing utility (Prevents shape errors)
                 mp_drawing.draw_landmarks(
                     frame,
                     hand_landmarks,
@@ -70,6 +115,9 @@ with mp_hands.Hands(
                 cx, cy = int(wrist_landmark.x * w), int(wrist_landmark.y * h)
                 cv2.putText(frame, hand_label, (cx - 20, cy + 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        else:
+            start_x = None
+
 
         # Display window
         cv2.imshow('MediaPipe Legacy Hand Tracker', frame)
