@@ -1,40 +1,177 @@
 import os
 import time
-
-# 1. Forcefully block macOS from injecting background camera portrait/blur layers
-os.environ["MEDIAPIPE_DISABLE_GPU"] = "1"
-os.environ["CMIO_DISABLE_PORTRAIT_EFFECTS"] = "1"
-
+import subprocess
+from collections import deque
 import cv2
 import mediapipe as mp
 import pyautogui
+
+# 1. Forcefully block macOS from injecting background camera portrait/blur layers[cite: 1, 2]
+os.environ["MEDIAPIPE_DISABLE_GPU"] = "1"
+os.environ["CMIO_DISABLE_PORTRAIT_EFFECTS"] = "1"
 
 # Disable failsafe to prevent the script from crashing if mouse goes to the screen corner
 pyautogui.FAILSAFE = False 
 pyautogui.PAUSE = 0
 
-# 2. Bypasse the C++ tasks backend completely
+# 2. Initialize legacy solutions (Bypasses the C++ tasks backend completely)[cite: 1, 2]
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
 mp_drawing_styles = mp.solutions.drawing_styles
 
-# Standard 21-point hand skeleton connections map automatically
 HAND_CONNECTIONS = mp_hands.HAND_CONNECTIONS
 
-# 3. Target Mac FaceTime camera using AVFOUNDATION backend
+# Landmark indices (MediaPipe Hands topology)
+WRIST = 0
+INDEX_TIP, INDEX_PIP, INDEX_MCP = 8, 6, 5
+MIDDLE_TIP, MIDDLE_PIP = 12, 10
+RING_TIP, RING_PIP = 16, 14
+PINKY_TIP, PINKY_PIP = 20, 18
+
+# ---- Gesture tuning knobs -------------------------------------------------
+HORIZONTAL_SWIPE_PX = 150       # Distance for left/right slide control[cite: 1]
+VERTICAL_SWIPE_PX = 55          # Distance for up/down volume control
+GESTURE_COOLDOWN_SEC = 1.0      # Time between triggered gestures[cite: 1]
+HISTORY_WINDOW_SEC = 0.5        # Timeframe to evaluate the swipe speed[cite: 2]
+VOLUME_STEP = 5                 # % volume change per swipe[cite: 2]
+# ---------------------------------------------------------------------------
+
+
+class MacVolumeController:
+    """Wraps `osascript` calls so we can read/set the macOS output volume."""
+    def __init__(self):
+        self._volume = self._get_system_volume()
+
+    @staticmethod
+    def _get_system_volume():
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", "output volume of (get volume settings)"],
+                capture_output=True, text=True, timeout=2,
+            )
+            return int(result.stdout.strip())
+        except Exception:
+            return 50  
+
+    def _apply(self, new_volume):
+        new_volume = max(0, min(100, new_volume))
+        try:
+            subprocess.run(
+                ["osascript", "-e", f"set volume output volume {new_volume}"],
+                timeout=2,
+            )
+            self._volume = new_volume
+        except Exception as exc:
+            print(f"[volume] failed to set volume: {exc}")
+        return self._volume
+
+    def step(self, direction):
+        return self._apply(self._volume + direction * VOLUME_STEP)
+
+    @property
+    def volume(self):
+        return self._volume
+
+
+def is_index_pointing(landmarks):
+    """True when the index finger is extended and the other fingers are curled[cite: 2]."""
+    index_extended = landmarks[INDEX_TIP].y < landmarks[INDEX_PIP].y
+    middle_curled = landmarks[MIDDLE_TIP].y > landmarks[MIDDLE_PIP].y
+    ring_curled = landmarks[RING_TIP].y > landmarks[RING_PIP].y
+    pinky_curled = landmarks[PINKY_TIP].y > landmarks[PINKY_PIP].y
+    return index_extended and middle_curled and ring_curled and pinky_curled
+
+def is_whole_hand_open(landmarks):
+    """True when the index, middle, ring, and pinky fingers are all extended."""
+    index_extended = landmarks[INDEX_TIP].y < landmarks[INDEX_PIP].y
+    middle_extended = landmarks[MIDDLE_TIP].y < landmarks[MIDDLE_PIP].y
+    ring_extended = landmarks[RING_TIP].y < landmarks[RING_PIP].y
+    pinky_extended = landmarks[PINKY_TIP].y < landmarks[PINKY_PIP].y
+    return index_extended and middle_extended and ring_extended and pinky_extended
+
+
+class SwipeDetector:
+    """Tracks both X and Y axes to fire presentation or volume controls seamlessly."""
+    def __init__(self, on_swipe):
+        self.on_swipe = on_swipe
+        self.history = deque()  # (timestamp, x_pixel, y_pixel)
+        self.last_trigger_time = 0.0
+
+    def reset(self):
+        self.history.clear()
+
+    def update(self, tip_x_px, tip_y_px, now, allowed_axis):
+        self.history.append((now, tip_x_px, tip_y_px))
+        
+        # Prune old tracking data
+        while self.history and now - self.history[0][0] > HISTORY_WINDOW_SEC:
+            self.history.popleft()
+
+        if now - self.last_trigger_time < GESTURE_COOLDOWN_SEC:
+            return None
+        if len(self.history) < 2:
+            return None
+
+        oldest_x = self.history[0][1]
+        oldest_y = self.history[0][2]
+        
+        dx = tip_x_px - oldest_x
+        dy = tip_y_px - oldest_y  
+
+        # Evaluate against the explicitly allowed axis
+        if allowed_axis == "horizontal" and abs(dx) > abs(dy) and abs(dx) >= HORIZONTAL_SWIPE_PX:
+            direction = "right" if dx > 0 else "left"
+            self.last_trigger_time = now
+            self.history.clear()
+            self.on_swipe(direction)
+            return direction
+            
+        elif allowed_axis == "vertical" and abs(dy) >= abs(dx) and abs(dy) >= VERTICAL_SWIPE_PX:
+            direction = "up" if dy < 0 else "down"
+            self.last_trigger_time = now
+            self.history.clear()
+            self.on_swipe(direction)
+            return direction
+                
+        return None
+
+# 3. Target your Mac FaceTime camera using AVFOUNDATION backend[cite: 1, 2]
 cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
+volume_controller = MacVolumeController()
 
-# Swipe tracking variables
-start_x = None
-cooldown_time = 0
-SWIPE_THRESHOLD = 150    # Pixels the hand must travel horizontally to trigger a swipe
-COOLDOWN_DURATION = 1.0  # Seconds to wait between slide transitions
+last_swipe_label = ""
+last_swipe_label_until = 0.0
 
-# Configure the tracking instance
+def handle_swipe(direction):
+    global last_swipe_label, last_swipe_label_until
+    
+    if direction == "up":
+        new_vol = volume_controller.step(+1)
+        last_swipe_label = f"Volume UP -> {new_vol}%"
+        print(last_swipe_label)
+    elif direction == "down":
+        new_vol = volume_controller.step(-1)
+        last_swipe_label = f"Volume DOWN -> {new_vol}%"
+        print(last_swipe_label)
+    elif direction == "right":
+        pyautogui.press('right')
+        last_swipe_label = "Swiped Right! -> Next Slide"
+        print(last_swipe_label)
+    elif direction == "left":
+        pyautogui.press('left')
+        last_swipe_label = "Swiped Left! -> Prev Slide"
+        print(last_swipe_label)
+        
+    last_swipe_label_until = time.time() + 1.0
+
+
+swipe_detector = SwipeDetector(on_swipe=handle_swipe)
+
+# Configure the tracking instance[cite: 1, 2]
 with mp_hands.Hands(
-    static_image_mode=False,        # Optimized for continuous video tracking
+    static_image_mode=False,        
     max_num_hands=2,
-    model_complexity=1,             # 1 is standard, lightweight, and stable
+    model_complexity=1,             
     min_detection_confidence=0.5,
     min_tracking_confidence=0.5
 ) as hands:
@@ -45,63 +182,27 @@ with mp_hands.Hands(
             print("Ignoring empty camera frame.")
             continue
 
-        # Flip horizontally for natural mirror view
+        # Flip horizontally for natural mirror view[cite: 1, 2]
         frame = cv2.flip(frame, 1)
         h, w, _ = frame.shape
+        now = time.time()
 
-        # Convert OpenCV BGR frame to MediaPipe required RGB format
+        # Convert OpenCV BGR frame to MediaPipe required RGB format[cite: 1, 2]
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
-        # Performance optimization: Mark image as flag non-writeable to speed up pass-by-reference
         rgb_frame.flags.writeable = False
-        
-        # Process the frame (Legacy infers timestamp tracking out of the box)
         results = hands.process(rgb_frame)
-
-        # Draw overlays if hands are tracked
         rgb_frame.flags.writeable = True
+
+        tracking_this_frame = False
+
         if results.multi_hand_landmarks:
-            hand_landmarks = results.multi_hand_landmarks[0]
-
-            # Track index finger tip (8) instead of the wrist for wider movement
-            index_finger = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
-            current_x = int(index_finger.x * w)
-            current_y = int(index_finger.y * h)
-
-            # Draw a blue circle on the tracked finger for visual feedback
-            cv2.circle(frame, (current_x, current_y), 15, (255, 0, 0), cv2.FILLED)
-
-            current_time = time.time()
-
-            # Process movement only if the cooldown has expired
-            if current_time > cooldown_time:
-                if start_x is None:
-                    # Drop an anchor point when the hand is first detected
-                    start_x = current_x
-                else:
-                    # Calculate horizontal distance moved from the anchor
-                    diff_x = current_x - start_x
-
-                    if diff_x > SWIPE_THRESHOLD:
-                        print("Swiped Right! -> Next Slide")
-                        pyautogui.press('right')
-                        cooldown_time = current_time + COOLDOWN_DURATION
-                        start_x = None  # Reset anchor
-                        
-                    elif diff_x < -SWIPE_THRESHOLD:
-                        print("Swiped Left! -> Previous Slide")
-                        pyautogui.press('left')
-                        cooldown_time = current_time + COOLDOWN_DURATION
-                        start_x = None  # Reset anchor
-
             for idx, hand_landmarks in enumerate(results.multi_hand_landmarks):
-                
-                # Fetch handedness (Left vs Right)
+
                 hand_label = "Hand"
                 if results.multi_handedness and idx < len(results.multi_handedness):
                     hand_label = results.multi_handedness[idx].classification[0].label
 
-                # 4. Use MediaPipe's drawing utility (Prevents shape errors)
+                # 4. Use MediaPipe's drawing utility[cite: 1, 2]
                 mp_drawing.draw_landmarks(
                     frame,
                     hand_landmarks,
@@ -110,19 +211,40 @@ with mp_hands.Hands(
                     mp_drawing_styles.get_default_hand_connections_style()
                 )
 
-                # Get pixel coordinates of the wrist (landmark 0) to append text label
-                wrist_landmark = hand_landmarks.landmark[0]
+                wrist_landmark = hand_landmarks.landmark[WRIST]
                 cx, cy = int(wrist_landmark.x * w), int(wrist_landmark.y * h)
                 cv2.putText(frame, hand_label, (cx - 20, cy + 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-        else:
-            start_x = None
 
+                # Evaluate hand states
+                is_pointing = is_index_pointing(hand_landmarks.landmark)
+                is_open = is_whole_hand_open(hand_landmarks.landmark)
 
-        # Display window
-        cv2.imshow('MediaPipe Legacy Hand Tracker', frame)
+                # Track gestures based on the specific hand shape
+                if is_pointing or is_open:
+                    tracking_this_frame = True
+                    tip = hand_landmarks.landmark[INDEX_TIP]
+                    tip_x, tip_y = int(tip.x * w), int(tip.y * h)
+                    
+                    # Visual feedback: Blue = Volume (Pointing), Yellow = Slides (Open Hand)
+                    color = (255, 0, 0) if is_pointing else (0, 255, 255) 
+                    cv2.circle(frame, (tip_x, tip_y), 15, color, cv2.FILLED)
+                    
+                    allowed_axis = "vertical" if is_pointing else "horizontal"
+                    swipe_detector.update(tip_x, tip_y, now, allowed_axis)
 
-        # Press 'q' to exit safely
+        if not tracking_this_frame:
+            swipe_detector.reset()
+
+        # HUD feedback[cite: 2]
+        cv2.putText(frame, f"Volume: {volume_controller.volume}%", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        if last_swipe_label and now < last_swipe_label_until:
+            cv2.putText(frame, last_swipe_label, (10, 65),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+        cv2.imshow('Unified Mac Gesture Controller', frame)
+
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
