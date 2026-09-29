@@ -6,7 +6,7 @@ import cv2
 import mediapipe as mp
 import pyautogui
 
-# 1. Forcefully block macOS from injecting background camera portrait/blur layers[cite: 1, 2]
+# 1. Forcefully block macOS from injecting background camera portrait/blur layers
 os.environ["MEDIAPIPE_DISABLE_GPU"] = "1"
 os.environ["CMIO_DISABLE_PORTRAIT_EFFECTS"] = "1"
 
@@ -14,7 +14,7 @@ os.environ["CMIO_DISABLE_PORTRAIT_EFFECTS"] = "1"
 pyautogui.FAILSAFE = False 
 pyautogui.PAUSE = 0
 
-# 2. Initialize legacy solutions (Bypasses the C++ tasks backend completely)[cite: 1, 2]
+# 2. Initialize legacy solutions (Bypasses the C++ tasks backend completely)
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
 mp_drawing_styles = mp.solutions.drawing_styles
@@ -29,11 +29,11 @@ RING_TIP, RING_PIP = 16, 14
 PINKY_TIP, PINKY_PIP = 20, 18
 
 # ---- Gesture tuning knobs -------------------------------------------------
-HORIZONTAL_SWIPE_PX = 150       # Distance for left/right slide control[cite: 1]
+HORIZONTAL_SWIPE_PX = 150       # Distance for left/right slide control
 VERTICAL_SWIPE_PX = 55          # Distance for up/down volume control
-GESTURE_COOLDOWN_SEC = 1.0      # Time between triggered gestures[cite: 1]
-HISTORY_WINDOW_SEC = 0.5        # Timeframe to evaluate the swipe speed[cite: 2]
-VOLUME_STEP = 5                 # % volume change per swipe[cite: 2]
+GESTURE_COOLDOWN_SEC = 1.0      # Time between triggered gestures
+HISTORY_WINDOW_SEC = 0.5        # Timeframe to evaluate the swipe speed
+VOLUME_STEP = 5                 # % volume change per swipe
 # ---------------------------------------------------------------------------
 
 
@@ -74,7 +74,7 @@ class MacVolumeController:
 
 
 def is_index_pointing(landmarks):
-    """True when the index finger is extended and the other fingers are curled[cite: 2]."""
+    """True when the index finger is extended and the other fingers are curled."""
     index_extended = landmarks[INDEX_TIP].y < landmarks[INDEX_PIP].y
     middle_curled = landmarks[MIDDLE_TIP].y > landmarks[MIDDLE_PIP].y
     ring_curled = landmarks[RING_TIP].y > landmarks[RING_PIP].y
@@ -89,6 +89,13 @@ def is_whole_hand_open(landmarks):
     pinky_extended = landmarks[PINKY_TIP].y < landmarks[PINKY_PIP].y
     return index_extended and middle_extended and ring_extended and pinky_extended
 
+def is_peace_sign(landmarks):
+    """True when the index and middle fingers are extended, and ring/pinky are curled."""
+    index_extended = landmarks[INDEX_TIP].y < landmarks[INDEX_PIP].y
+    middle_extended = landmarks[MIDDLE_TIP].y < landmarks[MIDDLE_PIP].y
+    ring_curled = landmarks[RING_TIP].y > landmarks[RING_PIP].y
+    pinky_curled = landmarks[PINKY_TIP].y > landmarks[PINKY_PIP].y
+    return index_extended and middle_extended and ring_curled and pinky_curled
 
 class SwipeDetector:
     """Tracks both X and Y axes to fire presentation or volume controls seamlessly."""
@@ -135,12 +142,13 @@ class SwipeDetector:
                 
         return None
 
-# 3. Target your Mac FaceTime camera using AVFOUNDATION backend[cite: 1, 2]
+# 3. Target your Mac FaceTime camera using AVFOUNDATION backend
 cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
 volume_controller = MacVolumeController()
 
 last_swipe_label = ""
 last_swipe_label_until = 0.0
+last_screenshot_time = 0.0
 
 def handle_swipe(direction):
     global last_swipe_label, last_swipe_label_until
@@ -167,7 +175,7 @@ def handle_swipe(direction):
 
 swipe_detector = SwipeDetector(on_swipe=handle_swipe)
 
-# Configure the tracking instance[cite: 1, 2]
+# Configure the tracking instance
 with mp_hands.Hands(
     static_image_mode=False,        
     max_num_hands=2,
@@ -182,12 +190,12 @@ with mp_hands.Hands(
             print("Ignoring empty camera frame.")
             continue
 
-        # Flip horizontally for natural mirror view[cite: 1, 2]
+        # Flip horizontally for natural mirror view
         frame = cv2.flip(frame, 1)
         h, w, _ = frame.shape
         now = time.time()
 
-        # Convert OpenCV BGR frame to MediaPipe required RGB format[cite: 1, 2]
+        # Convert OpenCV BGR frame to MediaPipe required RGB format
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         rgb_frame.flags.writeable = False
         results = hands.process(rgb_frame)
@@ -202,7 +210,7 @@ with mp_hands.Hands(
                 if results.multi_handedness and idx < len(results.multi_handedness):
                     hand_label = results.multi_handedness[idx].classification[0].label
 
-                # 4. Use MediaPipe's drawing utility[cite: 1, 2]
+                # 4. Use MediaPipe's drawing utility
                 mp_drawing.draw_landmarks(
                     frame,
                     hand_landmarks,
@@ -220,8 +228,28 @@ with mp_hands.Hands(
                 is_pointing = is_index_pointing(hand_landmarks.landmark)
                 is_open = is_whole_hand_open(hand_landmarks.landmark)
 
+                is_peace = is_peace_sign(hand_landmarks.landmark)
+
+                # Check for screenshot trigger
+                if is_peace:
+                    if now - last_screenshot_time > GESTURE_COOLDOWN_SEC:
+                        filename = f"screenshot_{int(now)}.png"
+                        subprocess.run(["screencapture", filename])
+                        
+                        last_screenshot_time = now
+                        last_swipe_label = f"Screenshot Saved: {filename}"
+                        last_swipe_label_until = now + 2.0
+                        print(last_swipe_label)
+                        
+                    # Visual feedback for peace sign
+                    tip_idx = hand_landmarks.landmark[INDEX_TIP]
+                    tip_mid = hand_landmarks.landmark[MIDDLE_TIP]
+                    cv2.circle(frame, (int(tip_idx.x * w), int(tip_idx.y * h)), 15, (0, 255, 0), cv2.FILLED)
+                    cv2.circle(frame, (int(tip_mid.x * w), int(tip_mid.y * h)), 15, (0, 255, 0), cv2.FILLED)
+
+
                 # Track gestures based on the specific hand shape
-                if is_pointing or is_open:
+                elif is_pointing or is_open:
                     tracking_this_frame = True
                     tip = hand_landmarks.landmark[INDEX_TIP]
                     tip_x, tip_y = int(tip.x * w), int(tip.y * h)
@@ -236,7 +264,7 @@ with mp_hands.Hands(
         if not tracking_this_frame:
             swipe_detector.reset()
 
-        # HUD feedback[cite: 2]
+        # HUD feedback
         cv2.putText(frame, f"Volume: {volume_controller.volume}%", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         if last_swipe_label and now < last_swipe_label_until:
