@@ -50,3 +50,12 @@ class GestureDetector:
         ring_curled = landmarks[RING_TIP].y > landmarks[RING_PIP].y
         pinky_curled = landmarks[PINKY_TIP].y > landmarks[PINKY_PIP].y
         return index_extended and middle_extended and ring_curled and pinky_curled
+
+    @staticmethod
+    def is_closed_fist(landmarks):
+        """True when the index, middle, ring, and pinky fingers are all curled."""
+        index_curled = landmarks[INDEX_TIP].y > landmarks[INDEX_PIP].y
+        middle_curled = landmarks[MIDDLE_TIP].y > landmarks[MIDDLE_PIP].y
+        ring_curled = landmarks[RING_TIP].y > landmarks[RING_PIP].y
+        pinky_curled = landmarks[PINKY_TIP].y > landmarks[PINKY_PIP].y
+        return index_curled and middle_curled and ring_curled and pinky_curled

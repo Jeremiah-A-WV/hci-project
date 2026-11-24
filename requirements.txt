@@ -5,3 +5,4 @@ codrone_edu
 fastapi
 uvicorn
 websockets
+numpy
